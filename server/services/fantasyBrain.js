@@ -1,606 +1,878 @@
 /**
- * fantasyBrain.js — Expert fantasy football logic engine
- * Pure computation — no Claude calls. Feeds structured intelligence into AI prompts.
+ * fantasyBrain.js — Elite High-Stakes Fantasy Football Engine
+ *
+ * NOT a consensus recommendation tool. This is a probabilistic market-game
+ * optimizer that maximizes first-place equity in top-heavy payout structures.
+ *
+ * Core principle: Opportunity > talent > box-score results
  */
 
-// ─────────────────────────────────────────────────────────────────────────────
-// A) POSITIONAL VALUE TIERS
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// FORMAT DEFINITIONS & SCORING MULTIPLIERS
+// ═══════════════════════════════════════════════════════════════════════════════
 
-const POSITIONAL_DATA = {
+const FORMATS = {
+  'PPR':       { recBonus: 1.0,  label: 'Full PPR',   rbRecAdj: 1.3, wrAdj: 1.1, teAdj: 1.15, qbAdj: 1.0 },
+  'Half':      { recBonus: 0.5,  label: 'Half PPR',   rbRecAdj: 1.15, wrAdj: 1.05, teAdj: 1.05, qbAdj: 1.0 },
+  'Standard':  { recBonus: 0.0,  label: 'Standard',   rbRecAdj: 1.0, wrAdj: 1.0, teAdj: 0.9, qbAdj: 1.0 },
+  'Superflex': { recBonus: 1.0,  label: 'Superflex',  rbRecAdj: 1.1, wrAdj: 1.0, teAdj: 1.05, qbAdj: 1.6 },
+  '2QB':       { recBonus: 1.0,  label: '2QB',        rbRecAdj: 1.0, wrAdj: 0.95, teAdj: 1.0, qbAdj: 1.8 },
+  'TEPrem':    { recBonus: 1.5,  label: 'TE Premium',  rbRecAdj: 1.0, wrAdj: 0.95, teAdj: 1.4, qbAdj: 1.0 },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POSITIONAL TIERS — Usage & Opportunity Thresholds
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const POSITIONAL_TIERS = {
   QB: {
-    tier: 'moderate',
-    draftWindow: 'rounds 3-8',
-    replacementDropoff: 'gradual',
-    notes: 'Elite QBs (Mahomes, Allen, Lamar) worth rounds 3-5 in 6pt passing TD. Position is deep — late-round QB viable. In 4pt passing TD leagues, wait longer.',
-    replacementLevel: { passYds: 3800, passTDs: 22, rushYds: 150, rushTDs: 1, INTs: 12, fantasyPts: 280 },
-    starterSlots: 1,
+    elite:    { snapPct: 0.98, rushUpsideFloor: 50, passingFloor: 4200, tdFloor: 30 },
+    starter:  { snapPct: 0.95, rushUpsideFloor: 20, passingFloor: 3800, tdFloor: 24 },
+    stream:   { snapPct: 0.90, rushUpsideFloor: 0,  passingFloor: 3200, tdFloor: 18 },
+    // QB replacement level is cheap in 1QB — expensive in SF/2QB
+    replacementVOR: { '1QB': 12, 'SF': 55, '2QB': 65 },
+    scarcity: { tier: 'deep', draftWindow: 'Rounds 6-8 or 11+', replacementDropoff: 'Minimal in 1QB, steep in SF' },
   },
   RB: {
-    tier: 'elite',
-    draftWindow: 'rounds 1-4',
-    replacementDropoff: 'massive',
-    notes: 'Most scarce position. Top-12 RBs dominate. Workload cliff after pick 40-50. Bell-cow backs with 3-down roles are premium assets. Injury risk is extreme.',
-    replacementLevel: { rushYds: 600, rushTDs: 4, rec: 25, recYds: 180, recTDs: 1, fantasyPts: 140 },
-    starterSlots: 2,
+    elite:    { snapPct: 0.70, targetShare: 0.06, goalLineShare: 0.60, twoDownPct: 0.75 },
+    starter:  { snapPct: 0.55, targetShare: 0.04, goalLineShare: 0.40, twoDownPct: 0.55 },
+    flex:     { snapPct: 0.40, targetShare: 0.03, goalLineShare: 0.20, twoDownPct: 0.40 },
+    // RB replacement is the steepest cliff — the top 6-8 are separated from the field
+    replacementVOR: 40,
+    scarcity: { tier: 'elite', draftWindow: 'Rounds 1-3', replacementDropoff: 'Massive — top 8 RBs are irreplaceable' },
+    injuryRate: 0.42, // highest injury rate of any position
+    ageCliff: 27,     // production cliff age
   },
   WR: {
-    tier: 'deep',
-    draftWindow: 'rounds 1-10',
-    replacementDropoff: 'gradual',
-    notes: 'Deepest skill position. Top-5 WRs (1,500+ yd ceiling) are round 1 value. Massive depth through round 10. PPR boosts slot receivers.',
-    replacementLevel: { rec: 50, recYds: 650, recTDs: 4, fantasyPts: 135 },
-    starterSlots: 2,
+    elite:    { targetShare: 0.26, targetsPRR: 0.22, airYardsShare: 0.30, snapPct: 0.92 },
+    starter:  { targetShare: 0.20, targetsPRR: 0.18, airYardsShare: 0.22, snapPct: 0.85 },
+    flex:     { targetShare: 0.14, targetsPRR: 0.14, airYardsShare: 0.15, snapPct: 0.75 },
+    // WR depth is good but the alpha WR1 tier is separated
+    replacementVOR: 30,
+    scarcity: { tier: 'deep_top_heavy', draftWindow: 'Rounds 1-6', replacementDropoff: 'Top 8 separated; mid-range is deep' },
+    primeWindow: [23, 29], // age range of peak WR production
   },
   TE: {
-    tier: 'scarce',
-    draftWindow: 'rounds 2-6',
-    replacementDropoff: 'massive',
-    notes: 'Only 3-4 elite TEs exist (Kelce, Andrews tier). The drop from TE3 to TE8 is enormous. Replacement-level TE scores ~60% of elite TE. TE premium leagues amplify this.',
-    replacementLevel: { rec: 35, recYds: 400, recTDs: 3, fantasyPts: 90 },
-    starterSlots: 1,
+    elite:    { targetShare: 0.22, targetsPRR: 0.20, snapPct: 0.88, routePct: 0.75 },
+    starter:  { targetShare: 0.15, targetsPRR: 0.15, snapPct: 0.80, routePct: 0.60 },
+    stream:   { targetShare: 0.10, targetsPRR: 0.10, snapPct: 0.70, routePct: 0.45 },
+    // TE is the scarcest position — the top 3-5 are massively separated
+    replacementVOR: 50,
+    scarcity: { tier: 'scarce', draftWindow: 'Rounds 3-5 for elite, stream otherwise', replacementDropoff: 'Extreme — top 3 are league-winners' },
   },
   K: {
-    tier: 'replacement',
-    draftWindow: 'round 15+',
-    replacementDropoff: 'minimal',
-    notes: 'Never draft before round 15. Stream based on Vegas-implied team totals and dome matchups. Top K vs replacement K gap is ~2 pts/week.',
-    replacementLevel: { fgMade: 22, patMade: 30, fantasyPts: 115 },
-    starterSlots: 1,
+    replacementVOR: 5,
+    scarcity: { tier: 'fungible', draftWindow: 'Last pick or stream', replacementDropoff: 'None — stream weekly' },
   },
   DEF: {
-    tier: 'replacement',
-    draftWindow: 'round 14+',
-    replacementDropoff: 'minimal',
-    notes: 'Stream weekly based on matchup. Target defenses facing bad offenses, high-turnover QBs. Never draft before round 14. Preseason consensus rankings are noise.',
-    replacementLevel: { sacks: 30, ints: 10, fumRec: 8, defTDs: 2, fantasyPts: 100 },
-    starterSlots: 1,
+    replacementVOR: 5,
+    scarcity: { tier: 'fungible', draftWindow: 'Last pick or stream', replacementDropoff: 'None — stream weekly' },
   },
   FLEX: {
-    tier: 'deep',
-    draftWindow: 'rounds 5-12',
-    replacementDropoff: 'gradual',
-    notes: 'RB/WR/TE eligible. Fill with best available value — volume is king. PPR leagues favor high-target WRs and pass-catching RBs.',
-    replacementLevel: { fantasyPts: 130 },
-    starterSlots: 1,
+    replacementVOR: 20,
+    scarcity: { tier: 'moderate', draftWindow: 'Rounds 5-8', replacementDropoff: 'Moderate' },
   },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NFL SCHEDULE INTELLIGENCE — 2025 Bye Weeks (ref data for preseason)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const BYE_WEEKS_2025 = {
+  5:  ['DET', 'LAC', 'PHI', 'TEN'],
+  6:  ['KC', 'LAR', 'MIA', 'MIN'],
+  7:  ['CHI', 'DAL'],
+  8:  ['CLE', 'HOU'],
+  9:  ['DEN', 'JAX', 'PIT', 'SF'],
+  10: ['ATL', 'BUF', 'CIN', 'NYJ'],
+  11: ['CAR', 'NYG', 'NO', 'TB'],
+  12: ['ARI', 'GB', 'IND', 'WAS'],
+  13: ['BAL', 'LV', 'NE', 'SEA'],
+};
+
+// Flatten: team -> bye week
+const TEAM_BYE = {};
+for (const [week, teams] of Object.entries(BYE_WEEKS_2025)) {
+  teams.forEach(t => { TEAM_BYE[t] = parseInt(week); });
 }
 
-function getPositionalScarcity(position, leagueSize = 12) {
-  const pos = String(position || '').split('/')[0].split(',')[0].trim().toUpperCase()
-  const normalized = pos === 'D/ST' ? 'DEF' : pos
-  const data = POSITIONAL_DATA[normalized] || POSITIONAL_DATA['FLEX']
-  const scale = leagueSize / 12
+function isOnBye(team, week) {
+  return TEAM_BYE[(team || '').toUpperCase()] === week;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEFENSE STRENGTH TIERS — Opponent Matchup Quality
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const DEFENSE_TIERS = {
+  // tier 1: toughest matchups (avoid)
+  elite:  ['SF', 'BAL', 'DAL', 'BUF', 'NYJ', 'CLE'],
+  // tier 2: above average
+  good:   ['PIT', 'DEN', 'MIA', 'NE', 'PHI', 'DET'],
+  // tier 3: average
+  mid:    ['GB', 'KC', 'LAR', 'SEA', 'MIN', 'CIN', 'TB', 'NO', 'HOU'],
+  // tier 4: below average (target)
+  weak:   ['JAX', 'CAR', 'LV', 'ARI', 'TEN', 'IND', 'CHI', 'LAC'],
+  // tier 5: worst defenses (juicy matchups)
+  smash:  ['NYG', 'WAS', 'ATL'],
+};
+
+function getMatchupQuality(team, opponent, week) {
+  if (!opponent) return { score: 50, grade: 'Unknown', tier: 'mid' };
+  if (isOnBye(team, week)) return { score: 0, grade: 'BYE', tier: 'bye' };
+
+  const opp = opponent.toUpperCase();
+  if (DEFENSE_TIERS.smash.includes(opp))  return { score: 90, grade: 'Smash', tier: 'smash' };
+  if (DEFENSE_TIERS.weak.includes(opp))   return { score: 75, grade: 'Favorable', tier: 'weak' };
+  if (DEFENSE_TIERS.mid.includes(opp))    return { score: 50, grade: 'Neutral', tier: 'mid' };
+  if (DEFENSE_TIERS.good.includes(opp))   return { score: 30, grade: 'Tough', tier: 'good' };
+  if (DEFENSE_TIERS.elite.includes(opp))  return { score: 15, grade: 'Avoid', tier: 'elite' };
+  return { score: 50, grade: 'Unknown', tier: 'mid' };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCORING ENVIRONMENT DATA
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const TEAM_SCORING_ENV = {
+  // tier: pace & points/game environment (2025 baselines)
+  elite:    ['DET', 'MIA', 'BUF', 'SF', 'DAL', 'PHI'],     // 26+ ppg
+  good:     ['KC', 'CIN', 'HOU', 'BAL', 'JAX', 'LAR'],     // 23-26 ppg
+  average:  ['TB', 'MIN', 'SEA', 'GB', 'LAC', 'DEN'],      // 20-23 ppg
+  poor:     ['ATL', 'PIT', 'IND', 'TEN', 'CHI', 'ARI'],    // 17-20 ppg
+  bottom:   ['NYG', 'NYJ', 'NE', 'CAR', 'CLE', 'LV', 'WAS', 'NO'], // <17 ppg
+};
+
+function getScoringEnvironment(team) {
+  const t = (team || '').toUpperCase();
+  for (const [tier, teams] of Object.entries(TEAM_SCORING_ENV)) {
+    if (teams.includes(t)) return tier;
+  }
+  return 'average';
+}
+
+const SCORING_ENV_MULTIPLIER = {
+  elite: 1.15, good: 1.07, average: 1.0, poor: 0.92, bottom: 0.85,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VALUE OVER REPLACEMENT (VOR) — Usage-Weighted
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function calculateVOR(stats, position, leagueSize = 12, format = 'PPR') {
+  const pos = String(position || '').split('/')[0].split(',')[0].toUpperCase();
+  const fmtConfig = FORMATS[format] || FORMATS['PPR'];
+  const tierData = POSITIONAL_TIERS[pos];
+  if (!tierData) return 25;
+
+  const replacementBase = typeof tierData.replacementVOR === 'number'
+    ? tierData.replacementVOR
+    : (tierData.replacementVOR?.['1QB'] || 10);
+
+  if (!stats || Object.keys(stats).length === 0) return replacementBase;
+
+  let score = 0;
+
+  // Yahoo NFL stat IDs
+  const passYds   = parseFloat(stats['5'] || stats.passYds || 0);
+  const passTDs   = parseFloat(stats['6'] || stats.passTDs || 0);
+  const passINTs  = parseFloat(stats['7'] || stats.passINTs || 0);
+  const rushYds   = parseFloat(stats['8'] || stats.rushYds || 0);
+  const rushTDs   = parseFloat(stats['9'] || stats.rushTDs || 0);
+  const receptions= parseFloat(stats['11'] || stats.receptions || 0);
+  const recYds    = parseFloat(stats['12'] || stats.recYds || 0);
+  const recTDs    = parseFloat(stats['13'] || stats.recTDs || 0);
+  const fumbles   = parseFloat(stats['15'] || stats.fumbles || 0);
+  const targets   = parseFloat(stats.targets || 0);
+  const snaps     = parseFloat(stats.snaps || 0);
+
+  // Calculate raw fantasy points
+  let fpts = 0;
+  fpts += passYds * 0.04;
+  fpts += passTDs * 4;
+  fpts -= passINTs * 2;
+  fpts += rushYds * 0.1;
+  fpts += rushTDs * 6;
+  fpts += receptions * fmtConfig.recBonus;
+  fpts += recYds * 0.1;
+  fpts += recTDs * 6;
+  fpts -= fumbles * 2;
+
+  // Normalize to per-game (assume 17-game season if season totals)
+  const gamesPlayed = parseFloat(stats.gamesPlayed || stats.GP || 17);
+  const fptsPerGame = gamesPlayed > 0 ? fpts / gamesPlayed : 0;
+
+  // Position-specific VOR calculation
+  if (pos === 'QB') {
+    const qbBaseline = 16; // replacement QB scores ~16 fpts/gm in 1QB
+    score = Math.min(100, Math.max(0, ((fptsPerGame - qbBaseline) / 14) * 100 * fmtConfig.qbAdj));
+
+    // Rush upside bonus (dual-threat premium)
+    if (rushYds > 400 || rushTDs > 3) score = Math.min(100, score + 10);
+  }
+  else if (pos === 'RB') {
+    const rbBaseline = 8;
+    score = Math.min(100, Math.max(0, ((fptsPerGame - rbBaseline) / 16) * 100));
+
+    // Receiving work premium in PPR
+    if (receptions > 40) score = Math.min(100, score + 8 * fmtConfig.rbRecAdj);
+    if (receptions > 60) score = Math.min(100, score + 5 * fmtConfig.rbRecAdj);
+
+    // Goal-line role bonus
+    if (rushTDs > 6) score = Math.min(100, score + 5);
+  }
+  else if (pos === 'WR') {
+    const wrBaseline = 7;
+    score = Math.min(100, Math.max(0, ((fptsPerGame - wrBaseline) / 14) * 100 * fmtConfig.wrAdj));
+
+    // Target volume bonus
+    if (targets > 120) score = Math.min(100, score + 10);
+    else if (receptions > 80) score = Math.min(100, score + 7);
+
+    // Red zone target premium
+    if (recTDs > 6) score = Math.min(100, score + 5);
+  }
+  else if (pos === 'TE') {
+    const teBaseline = 5;
+    score = Math.min(100, Math.max(0, ((fptsPerGame - teBaseline) / 10) * 100 * fmtConfig.teAdj));
+
+    // Elite TE premium — the gap is massive
+    if (fptsPerGame > 12) score = Math.min(100, score + 15);
+  }
+  else if (pos === 'K' || pos === 'DEF') {
+    score = Math.min(40, Math.max(5, fptsPerGame * 3));
+  }
+
+  // Scoring environment adjustment
+  const team = stats.team || '';
+  const envMult = SCORING_ENV_MULTIPLIER[getScoringEnvironment(team)] || 1.0;
+  score = Math.min(100, score * envMult);
+
+  // League size adjustment — larger leagues = higher scarcity
+  if (leagueSize > 12) score = Math.min(100, score * 1.05);
+  if (leagueSize > 14) score = Math.min(100, score * 1.05);
+
+  return Math.round(Math.max(0, Math.min(100, score)));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POSITIONAL SCARCITY ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function getPositionalScarcity(position, leagueSize = 12, format = 'PPR') {
+  const pos = String(position || '').split('/')[0].split(',')[0].toUpperCase();
+  const tierData = POSITIONAL_TIERS[pos];
+  if (!tierData?.scarcity) return { tier: 'moderate', draftWindow: 'Mid rounds', replacementDropoff: 'Unknown' };
+
+  const scarcity = { ...tierData.scarcity };
+
+  // Format adjustments
+  if (pos === 'QB' && (format === 'Superflex' || format === '2QB')) {
+    scarcity.tier = 'elite';
+    scarcity.draftWindow = 'Rounds 1-4';
+    scarcity.replacementDropoff = 'Massive — QB scarcity dominates SF/2QB';
+  }
+  if (pos === 'TE' && format === 'TEPrem') {
+    scarcity.tier = 'ultra_scarce';
+    scarcity.draftWindow = 'Rounds 2-4 for elite';
+    scarcity.replacementDropoff = 'Extreme — TE premium inflates the top 3-5 massively';
+  }
+  if (pos === 'RB' && (format === 'PPR' || format === 'Half')) {
+    // In PPR, receiving RBs gain additional scarcity premium
+    scarcity.replacementDropoff += '. Pass-catching RBs carry extra PPR premium.';
+  }
+
+  // League size adjustments
+  if (leagueSize >= 14) {
+    if (scarcity.tier !== 'fungible') {
+      scarcity.replacementDropoff += ` (amplified in ${leagueSize}-team league)`;
+    }
+  }
+
+  return scarcity;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// USAGE SUSTAINABILITY DETECTOR
+// Higher-order: detects if production is backed by stable usage or fluky results
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function analyzeSustainability(player) {
+  const stats = player.stats || {};
+  const signals = [];
+  let sustainabilityScore = 50; // neutral baseline
+
+  const pos = String(player.position || '').split('/')[0].toUpperCase();
+  const targets = parseFloat(stats.targets || 0);
+  const receptions = parseFloat(stats.receptions || stats['11'] || 0);
+  const recTDs = parseFloat(stats.recTDs || stats['13'] || 0);
+  const rushTDs = parseFloat(stats.rushTDs || stats['9'] || 0);
+  const rushYds = parseFloat(stats.rushYds || stats['8'] || 0);
+  const recYds = parseFloat(stats.recYds || stats['12'] || 0);
+  const passYds = parseFloat(stats.passYds || stats['5'] || 0);
+  const gp = parseFloat(stats.gamesPlayed || stats.GP || 17);
+
+  if (pos === 'WR' || pos === 'TE') {
+    // TD regression: high TD rate on low targets = unsustainable
+    const tdRate = receptions > 0 ? recTDs / receptions : 0;
+    if (tdRate > 0.12 && targets < 100) {
+      signals.push({ flag: 'TD_REGRESSION', detail: `TD rate ${(tdRate*100).toFixed(1)}% on only ${targets} targets — regression likely`, impact: -15 });
+      sustainabilityScore -= 15;
+    }
+
+    // Volume backing: high target count = sustainable floor
+    if (targets > 130) {
+      signals.push({ flag: 'VOLUME_BACKED', detail: `${targets} targets — elite volume supports production`, impact: +15 });
+      sustainabilityScore += 15;
+    } else if (targets > 100) {
+      signals.push({ flag: 'SOLID_VOLUME', detail: `${targets} targets — solid usage`, impact: +8 });
+      sustainabilityScore += 8;
+    } else if (targets < 70 && recTDs > 5) {
+      signals.push({ flag: 'LOW_VOLUME_TD_DEPENDENT', detail: `Only ${targets} targets but ${recTDs} TDs — heavily TD-dependent`, impact: -12 });
+      sustainabilityScore -= 12;
+    }
+
+    // YPC/YPR sustainability
+    const ypr = receptions > 0 ? recYds / receptions : 0;
+    if (ypr > 18) {
+      signals.push({ flag: 'UNSUSTAINABLE_YPR', detail: `${ypr.toFixed(1)} yards/rec is likely to regress`, impact: -8 });
+      sustainabilityScore -= 8;
+    }
+  }
+
+  if (pos === 'RB') {
+    // TD regression
+    const tdsPerGame = gp > 0 ? rushTDs / gp : 0;
+    if (tdsPerGame > 0.7 && rushYds / gp < 65) {
+      signals.push({ flag: 'TD_REGRESSION', detail: `${rushTDs} rush TDs on ${(rushYds/gp).toFixed(0)} yds/gm — TD regression candidate`, impact: -12 });
+      sustainabilityScore -= 12;
+    }
+
+    // Receiving work sustains PPR value
+    if (receptions > 50) {
+      signals.push({ flag: 'RECEIVING_BACK', detail: `${receptions} receptions — PPR floor is strong and sustainable`, impact: +12 });
+      sustainabilityScore += 12;
+    }
+
+    // Workload injury concern
+    const touchesPerGame = gp > 0 ? ((parseFloat(stats.rushAttempts || 0) + receptions) / gp) : 0;
+    if (touchesPerGame > 22) {
+      signals.push({ flag: 'HEAVY_WORKLOAD', detail: `${touchesPerGame.toFixed(0)} touches/gm — durability concern`, impact: -5 });
+      sustainabilityScore -= 5;
+    }
+  }
+
+  if (pos === 'QB') {
+    // Rushing upside sustainability
+    const rushYdsPerGame = gp > 0 ? rushYds / gp : 0;
+    if (rushYdsPerGame > 35) {
+      signals.push({ flag: 'RUSHING_UPSIDE', detail: `${rushYdsPerGame.toFixed(0)} rush yds/gm — dual-threat creates high floor`, impact: +10 });
+      sustainabilityScore += 10;
+    }
+
+    // INT risk
+    const passINTs = parseFloat(stats.passINTs || stats['7'] || 0);
+    if (passINTs > 14) {
+      signals.push({ flag: 'INT_RISK', detail: `${passINTs} INTs — turnover-prone risk`, impact: -8 });
+      sustainabilityScore -= 8;
+    }
+  }
 
   return {
-    tier: data.tier,
-    draftWindow: data.draftWindow,
-    replacementDropoff: data.replacementDropoff,
-    replacementLevel: data.replacementLevel,
-    notes: data.notes,
-    urgencyScore: { elite: 10, scarce: 8, moderate: 5, deep: 2, replacement: 0 }[data.tier] || 3,
-  }
+    score: Math.max(0, Math.min(100, sustainabilityScore)),
+    signals,
+    verdict: sustainabilityScore >= 65 ? 'sustainable' :
+             sustainabilityScore >= 40 ? 'mixed' : 'regression_candidate',
+  };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// B) SCORING FORMAT STRATEGY
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTINGENT UPSIDE DETECTOR
+// Identifies backup players who are ONE injury away from league-winning workloads
+// ═══════════════════════════════════════════════════════════════════════════════
 
-const SCORING_ADJUSTMENTS = {
-  'PPR': { WR: 1.15, RB: 0.95, TE: 1.10 },       // PPR boosts WR/TE, slightly nerfs non-catching RBs
-  'Half PPR': { WR: 1.08, RB: 1.0, TE: 1.05 },
-  'Standard': { WR: 0.95, RB: 1.10, TE: 0.95 },   // Standard boosts RBs
-  '6pt Passing TD': { QB: 1.20 },                   // 6pt passing TDs raise QB value
-}
+function evaluateContingentUpside(player, rosterContext = []) {
+  const pos = String(player.position || '').split('/')[0].toUpperCase();
+  const stats = player.stats || {};
 
-function getScoringMultiplier(position, scoringType) {
-  const pos = String(position || '').toUpperCase()
-  const adjustments = SCORING_ADJUSTMENTS[scoringType] || {}
-  return adjustments[pos] || 1.0
-}
+  let contingentScore = 0;
+  const reasons = [];
 
-// ─────────────────────────────────────────────────────────────────────────────
-// C) VALUE OVER REPLACEMENT (VOR) CALCULATOR
-// ─────────────────────────────────────────────────────────────────────────────
+  if (pos === 'RB') {
+    const rushAttempts = parseFloat(stats.rushAttempts || stats['8'] || 0);
+    const receptions = parseFloat(stats.receptions || stats['11'] || 0);
+    const gp = parseFloat(stats.gamesPlayed || stats.GP || 17);
+    const touchesPerGame = gp > 0 ? (rushAttempts + receptions) / gp : 0;
 
-const STAT_WEIGHTS = {
-  passYds: 0.04,   // 1 pt per 25 yards
-  passTDs: 4.0,    // 4 pts per TD (standard)
-  INTs: -2.0,
-  rushYds: 0.1,    // 1 pt per 10 yards
-  rushTDs: 6.0,
-  rec: 1.0,        // PPR
-  recYds: 0.1,
-  recTDs: 6.0,
-  fumLost: -2.0,
-  fantasyPts: 1.0, // direct pts if available
-}
-
-function calculateVOR(playerStats = {}, position, leagueSize = 12) {
-  if (!playerStats || Object.keys(playerStats).length === 0) return 0
-
-  const pos = String(position || '').split('/')[0].split(',')[0].trim().toUpperCase()
-  const normalized = pos === 'D/ST' ? 'DEF' : pos
-  const scarcity = getPositionalScarcity(normalized, leagueSize)
-  const baseline = scarcity.replacementLevel
-
-  let rawScore = 0
-  let totalWeight = 0
-
-  // If we have raw fantasy points, use that as primary signal
-  const pts = parseFloat(playerStats.fantasyPts || playerStats.points || playerStats['57'] || 0)
-  const basePts = parseFloat(baseline.fantasyPts || 100)
-
-  if (pts > 0 && basePts > 0) {
-    rawScore = (pts - basePts) / Math.max(basePts, 1)
-    totalWeight = 1
-  }
-
-  if (totalWeight === 0) return 50  // no data, neutral score
-
-  const scarcityMultiplier = { elite: 1.4, scarce: 1.25, moderate: 1.0, deep: 0.85, replacement: 0.7 }[scarcity.tier] || 1.0
-  const normalized2 = (rawScore / totalWeight) * scarcityMultiplier
-
-  return Math.min(100, Math.max(0, Math.round(50 + normalized2 * 25)))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// D) SCHEDULE & MATCHUP INTELLIGENCE
-// ─────────────────────────────────────────────────────────────────────────────
-
-// NFL Bye weeks (2026 approximation — update each season)
-const BYE_WEEKS = {
-  ARI: 14, ATL: 12, BAL: 14, BUF: 12, CAR: 7, CHI: 7, CIN: 12,
-  CLE: 9, DAL: 7, DEN: 14, DET: 5, GB: 10, HOU: 14, IND: 14,
-  JAX: 12, KC: 6, LAC: 5, LAR: 10, LV: 10, MIA: 6, MIN: 6,
-  NE: 14, NO: 12, NYG: 11, NYJ: 12, PHI: 5, PIT: 9, SF: 9,
-  SEA: 10, TB: 11, TEN: 5, WAS: 14
-}
-
-// Defense strength tiers (approximation — 1.0 = average)
-const DEFENSE_STRENGTH = {
-  // Strong defenses (harder matchup for opposing offense)
-  SF: 0.85, DAL: 0.88, BUF: 0.88, BAL: 0.90, NYJ: 0.90, CLE: 0.92,
-  // Average
-  MIA: 0.97, PIT: 0.95, DEN: 0.95, PHI: 0.95, DET: 1.00, KC: 1.00,
-  GB: 1.00, MIN: 1.00, NO: 1.02, TB: 1.02, SEA: 1.02, LAR: 1.03,
-  // Weak defenses (better matchup for opposing offense)
-  NE: 1.08, CAR: 1.10, ARI: 1.08, LV: 1.05, NYG: 1.10,
-  WAS: 1.05, CHI: 1.05, TEN: 1.08, JAX: 1.05, ATL: 1.03,
-  IND: 1.03, CIN: 1.03, HOU: 1.00, LAC: 1.00,
-}
-
-// Dome/indoor venues
-const DOME_TEAMS = new Set(['ARI', 'ATL', 'DAL', 'DET', 'HOU', 'IND', 'LAC', 'LAR', 'LV', 'MIN', 'NO'])
-
-function getMatchupQuality(teamAbbr, opponentAbbr, weekNumber) {
-  const team = String(teamAbbr || '').toUpperCase()
-  const opp = String(opponentAbbr || '').toUpperCase()
-
-  const isBye = BYE_WEEKS[team] === weekNumber
-  const oppDefStrength = DEFENSE_STRENGTH[opp] || 1.0
-  const isDome = DOME_TEAMS.has(team) || DOME_TEAMS.has(opp) // home or away dome
-
-  let score = 50
-  if (isBye) return { score: 0, grade: 'BYE WEEK', isBye: true, isDome }
-
-  // Opponent defense quality
-  if (oppDefStrength >= 1.08) score += 20      // weak defense = great matchup
-  else if (oppDefStrength >= 1.04) score += 12
-  else if (oppDefStrength <= 0.90) score -= 15  // elite defense = tough matchup
-  else if (oppDefStrength <= 0.95) score -= 8
-
-  // Dome boost (reduces weather risk)
-  if (isDome) score += 5
-
-  return {
-    score: Math.min(100, Math.max(0, Math.round(score))),
-    grade: score >= 75 ? 'Smash spot' : score >= 60 ? 'Good matchup' : score >= 45 ? 'Neutral' : score >= 30 ? 'Tough matchup' : 'Avoid',
-    oppDefStrength,
-    isDome,
-    isBye: false,
-  }
-}
-
-function isOnBye(teamAbbr, weekNumber) {
-  return BYE_WEEKS[String(teamAbbr || '').toUpperCase()] === weekNumber
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// E) TRADE FAIRNESS ENGINE
-// ─────────────────────────────────────────────────────────────────────────────
-
-function evaluateTrade(giving = [], receiving = [], myRoster = [], leagueContext = {}) {
-  const leagueSize = leagueContext.num_teams || 12
-
-  const givingVOR = giving.reduce((sum, p) => sum + calculateVOR(p.stats || {}, p.position, leagueSize), 0)
-  const receivingVOR = receiving.reduce((sum, p) => sum + calculateVOR(p.stats || {}, p.position, leagueSize), 0)
-
-  const givingScarcity = giving.reduce((sum, p) => {
-    const s = getPositionalScarcity(p.position, leagueSize)
-    return sum + s.urgencyScore
-  }, 0)
-  const receivingScarcity = receiving.reduce((sum, p) => {
-    const s = getPositionalScarcity(p.position, leagueSize)
-    return sum + s.urgencyScore
-  }, 0)
-
-  const myPositions = myRoster.map(p => String(p.position || '').split('/')[0].toUpperCase())
-  const rosterNeedBonus = receiving.reduce((bonus, p) => {
-    const pos = String(p.position || '').split('/')[0].toUpperCase()
-    const countAtPos = myPositions.filter(mp => mp === pos).length
-    const scarcity = getPositionalScarcity(pos, leagueSize)
-    if (countAtPos === 0 && scarcity.tier !== 'deep') return bonus + 15
-    if (countAtPos === 0) return bonus + 8
-    return bonus
-  }, 0)
-
-  const countDelta = receiving.length - giving.length
-  const rosterSpotValue = countDelta < 0 ? 10 : countDelta > 0 ? -8 : 0
-
-  const vorDelta = receivingVOR - givingVOR
-  const scarcityDelta = receivingScarcity - givingScarcity
-  let score = (vorDelta * 0.6) + (scarcityDelta * 2) + rosterNeedBonus + rosterSpotValue
-
-  score = Math.max(-100, Math.min(100, Math.round(score)))
-
-  const verdict =
-    score >= 60 ? 'smash accept' :
-    score >= 20 ? 'accept' :
-    score >= -15 ? 'fair' :
-    score >= -45 ? 'decline' :
-    'insulting'
-
-  const reasoning = [
-    `VOR delta: ${receivingVOR > givingVOR ? '+' : ''}${(receivingVOR - givingVOR).toFixed(0)} in your favor`,
-    givingScarcity > receivingScarcity ? `You're giving up scarcer positional value` : `You're receiving scarcer positional value`,
-    rosterNeedBonus > 0 ? `Filling a roster hole adds ${rosterNeedBonus} need-bonus points` : null,
-  ].filter(Boolean).join('. ')
-
-  const counterOffer = score < -15 && receiving.length > 0
-    ? `Counter: ask them to add a ${getPositionalScarcity(giving[0]?.position, leagueSize).tier}-tier player to balance the VOR gap`
-    : score >= -15 && score < 20
-      ? `Negotiate: request a bench depth upgrade to push this from fair to favorable`
-      : ''
-
-  return { score, verdict, reasoning, counterOffer }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// F) WAIVER WIRE PRIORITY SCORING
-// ─────────────────────────────────────────────────────────────────────────────
-
-function scoreWaiverTarget(player = {}, myRoster = [], leagueSettings = {}) {
-  let score = 30
-
-  const pos = String(player.position || '').split('/')[0].toUpperCase()
-  const leagueSize = leagueSettings.num_teams || 12
-  const scarcity = getPositionalScarcity(pos, leagueSize)
-  const myPositions = myRoster.map(p => String(p.position || '').split('/')[0].toUpperCase())
-  const countAtPos = myPositions.filter(p => p === pos).length
-  const required = (leagueSettings.roster_slots || {})[pos] || (pos === 'RB' || pos === 'WR' ? 2 : 1)
-
-  // Positional need
-  if (countAtPos < required) score += scarcity.urgencyScore * 3
-  else if (countAtPos >= required) score -= 10
-
-  // Recent performance (simplified for NFL)
-  const recentPts = parseFloat(player.recentStats?.['57'] || player.recent_pts || 0)
-  const seasonPts = parseFloat(player.seasonStats?.['57'] || player.season_pts || 0)
-  if (recentPts > 0 && seasonPts > 0) {
-    if (recentPts > seasonPts * 1.30) score += 15  // outperforming
-    else if (recentPts < seasonPts * 0.70) score -= 10  // underperforming
-  }
-
-  score = Math.min(100, Math.max(0, Math.round(score)))
-
-  return {
-    score,
-    priority: score >= 85 ? 'MUST ADD' : score >= 70 ? 'High priority' : score >= 50 ? 'Speculative add' : score >= 35 ? 'Monitor' : 'Pass',
-    reasoning: `Positional need (${pos}: ${countAtPos}/${required}), scarcity: ${scarcity.tier}`,
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// G) WEEKLY LINEUP OPTIMIZATION
-// ─────────────────────────────────────────────────────────────────────────────
-
-function optimizeLineup(roster = [], weekNumber = 1, scoringType = 'PPR') {
-  if (!roster || roster.length === 0) {
-    return { starters: [], bench: [], reasoning: 'No roster provided.' }
-  }
-
-  const recommendations = roster.map(player => {
-    const team = String(player.team || '').toUpperCase()
-    const pos = String(player.position || '').split('/')[0].toUpperCase()
-    const isBye = isOnBye(team, weekNumber)
-
-    let startScore = 50
-
-    if (isBye) {
-      startScore = 0
-    } else {
-      // Positional base value
-      const posBonus = { QB: 15, RB: 12, WR: 10, TE: 8, K: 3, DEF: 3 }
-      startScore += posBonus[pos] || 5
-
-      // Recent pts trend
-      const recentPts = parseFloat(player.recentStats?.['57'] || player.recent_pts || 0)
-      const seasonPts = parseFloat(player.seasonStats?.['57'] || player.season_pts || 0)
-      if (recentPts > 0 && seasonPts > 0) {
-        startScore += ((recentPts - seasonPts) / Math.max(seasonPts, 1)) * 15
+    // Low current usage but on a team with a bellcow = handcuff
+    if (touchesPerGame < 10 && touchesPerGame > 2) {
+      const scoringEnv = getScoringEnvironment(player.team || '');
+      if (scoringEnv === 'elite' || scoringEnv === 'good') {
+        contingentScore = 75;
+        reasons.push('Backup RB on elite offense — starter injury makes this an RB1');
+      } else {
+        contingentScore = 55;
+        reasons.push('Backup RB — starter injury gives meaningful workload');
       }
     }
 
-    const onIR = player.injury_status === 'IR' || player.status === 'IR' || player.injury_status === 'O' || player.status === 'O'
-    if (onIR) startScore -= 50
-
-    const confidence = startScore >= 70 ? 'High' : startScore >= 45 ? 'Medium' : 'Low'
-
-    return {
-      player_name: player.player_name || player.name,
-      position: player.position,
-      team: player.team,
-      isBye,
-      startScore: Math.round(startScore),
-      confidence,
-      reasoning: isBye ? `ON BYE — cannot start.` :
-        (onIR ? 'INJURED — do not start.' :
-        `${pos} — ${confidence} confidence.`)
+    // Already getting some work = committee could shift
+    if (touchesPerGame >= 8 && touchesPerGame < 15) {
+      contingentScore = Math.max(contingentScore, 60);
+      reasons.push('Committee back — injury or inefficiency could push to bellcow');
     }
-  })
+  }
 
-  const sorted = recommendations.sort((a, b) => b.startScore - a.startScore)
+  if (pos === 'WR') {
+    // WR2/WR3 on high-volume pass offense
+    const targets = parseFloat(stats.targets || 0);
+    const gp = parseFloat(stats.gamesPlayed || stats.GP || 17);
+    const tgtPerGame = gp > 0 ? targets / gp : 0;
+
+    if (tgtPerGame >= 4 && tgtPerGame < 7) {
+      const scoringEnv = getScoringEnvironment(player.team || '');
+      if (scoringEnv === 'elite' || scoringEnv === 'good') {
+        contingentScore = 50;
+        reasons.push('WR2/3 on pass-heavy offense — injury above him could unlock WR1 targets');
+      }
+    }
+  }
 
   return {
-    starters: sorted.filter(p => p.startScore >= 40 && !p.isBye && !p.reasoning.includes('INJURED')).slice(0, 14),
-    bench: sorted.filter(p => p.startScore < 40 || p.isBye || p.reasoning.includes('INJURED')),
-    reasoning: `Ranked ${roster.length} players for week ${weekNumber}. Bye weeks and injuries factored in.`,
-  }
+    score: Math.min(100, contingentScore),
+    reasons,
+    isContingentPlay: contingentScore >= 50,
+    classification: contingentScore >= 70 ? 'high_value_handcuff' :
+                    contingentScore >= 50 ? 'contingent_upside' : 'limited_upside',
+  };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// H) DRAFT STRATEGY PROFILES
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE FAIRNESS ENGINE — Market-Based
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function evaluateTrade(giving, receiving, myRoster, leagueContext = {}) {
+  const leagueSize = leagueContext.num_teams || 12;
+  const format = leagueContext.scoring_type || 'PPR';
+
+  // Calculate VOR for each side
+  const givingVOR = (giving || []).reduce((sum, p) => sum + calculateVOR(p.stats || {}, p.position, leagueSize, format), 0);
+  const receivingVOR = (receiving || []).reduce((sum, p) => sum + calculateVOR(p.stats || {}, p.position, leagueSize, format), 0);
+
+  const vorDelta = receivingVOR - givingVOR;
+
+  // Positional scarcity adjustment
+  let scarcityDelta = 0;
+  const givingPositions = (giving || []).map(p => String(p.position || '').split('/')[0].toUpperCase());
+  const receivingPositions = (receiving || []).map(p => String(p.position || '').split('/')[0].toUpperCase());
+
+  receivingPositions.forEach(pos => {
+    const s = getPositionalScarcity(pos, leagueSize, format);
+    if (s.tier === 'elite' || s.tier === 'scarce' || s.tier === 'ultra_scarce') scarcityDelta += 8;
+  });
+  givingPositions.forEach(pos => {
+    const s = getPositionalScarcity(pos, leagueSize, format);
+    if (s.tier === 'elite' || s.tier === 'scarce' || s.tier === 'ultra_scarce') scarcityDelta -= 8;
+  });
+
+  // Roster needs analysis — does the trade fill a void?
+  const rosterAnalysis = analyzeRosterStrengths(myRoster || [], leagueSize);
+  let needsDelta = 0;
+  receivingPositions.forEach(pos => {
+    if (rosterAnalysis.voids.includes(pos)) needsDelta += 10;
+  });
+  givingPositions.forEach(pos => {
+    if (rosterAnalysis.voids.includes(pos)) needsDelta -= 15; // penalize trading away need
+  });
+
+  // Player count penalty — avoid 3-for-1 that dilutes quality
+  const countDelta = receiving.length - giving.length;
+  const consolidationBonus = countDelta < 0 ? 5 * Math.abs(countDelta) : countDelta > 0 ? -3 * countDelta : 0;
+
+  // Sustainability check — prefer sustainable production
+  let sustainDelta = 0;
+  (receiving || []).forEach(p => {
+    const s = analyzeSustainability(p);
+    if (s.verdict === 'sustainable') sustainDelta += 5;
+    if (s.verdict === 'regression_candidate') sustainDelta -= 5;
+  });
+  (giving || []).forEach(p => {
+    const s = analyzeSustainability(p);
+    if (s.verdict === 'regression_candidate') sustainDelta += 3; // good to sell
+    if (s.verdict === 'sustainable') sustainDelta -= 3;
+  });
+
+  const totalScore = 50 + vorDelta * 0.3 + scarcityDelta + needsDelta + consolidationBonus + sustainDelta;
+  const score = Math.max(0, Math.min(100, Math.round(totalScore)));
+
+  const reasoning = [];
+  if (vorDelta > 5) reasoning.push(`VOR advantage: +${vorDelta.toFixed(0)} value gained`);
+  if (vorDelta < -5) reasoning.push(`VOR disadvantage: ${vorDelta.toFixed(0)} value lost`);
+  if (scarcityDelta > 0) reasoning.push('Gaining positional scarcity advantage');
+  if (scarcityDelta < 0) reasoning.push('Losing positional scarcity');
+  if (needsDelta > 0) reasoning.push('Trade fills a roster void');
+  if (needsDelta < 0) reasoning.push('⚠️ Trading away a position of need');
+  if (consolidationBonus > 0) reasoning.push('Good consolidation — fewer, better players');
+  if (sustainDelta > 0) reasoning.push('Acquiring more sustainable production');
+  if (sustainDelta < 0) reasoning.push('Acquiring less sustainable production');
+
+  return {
+    score,
+    verdict: score >= 65 ? 'ACCEPT' : score >= 45 ? 'FAIR_TRADE' : 'DECLINE',
+    reasoning: reasoning.join('. '),
+    vorDelta: +vorDelta.toFixed(1),
+    givingVOR, receivingVOR,
+    counterOffer: score < 40 ? 'You need more value back — try getting a draft pick or a better player added to their side.' : null,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WAIVER WIRE SCORING — Role Change First, Box Score Second
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function scoreWaiverTarget(player, myRoster = [], settings = {}) {
+  const pos = String(player.position || '').split('/')[0].toUpperCase();
+  const stats = player.stats || {};
+  const recentStats = player.recentStats || {};
+  let score = 25; // baseline
+  const reasons = [];
+
+  // 1. POSITIONAL NEED (highest weight)
+  const rosterAnalysis = analyzeRosterStrengths(myRoster, settings.num_teams || 12);
+  if (rosterAnalysis.voids.includes(pos)) {
+    score += 25;
+    reasons.push(`Fills ${pos} void`);
+  }
+
+  // 2. ROLE CHANGE SIGNALS (this is the edge — get there before the box score)
+  const contingent = evaluateContingentUpside(player);
+  if (contingent.isContingentPlay) {
+    score += 20;
+    reasons.push(contingent.reasons[0] || 'Contingent upside play');
+  }
+
+  // 3. USAGE METRICS > RAW STATS
+  const sustainability = analyzeSustainability(player);
+  if (sustainability.verdict === 'sustainable') {
+    score += 10;
+    reasons.push('Production backed by stable usage');
+  }
+
+  // 4. SCORING ENVIRONMENT
+  const env = getScoringEnvironment(player.team || '');
+  if (env === 'elite' || env === 'good') {
+    score += 8;
+    reasons.push(`Strong team scoring environment (${env})`);
+  }
+  if (env === 'bottom') {
+    score -= 5;
+    reasons.push('Poor team scoring environment');
+  }
+
+  // 5. RECENT TREND (secondary — don't chase box scores)
+  const vor = calculateVOR(stats, pos, settings.num_teams || 12);
+  if (vor >= 50) {
+    score += 10;
+    reasons.push(`VOR: ${vor}/100`);
+  }
+
+  // 6. K/DEF streaming — always low priority
+  if (pos === 'K' || pos === 'DEF') {
+    score = Math.min(30, score);
+    reasons.length = 0;
+    reasons.push('Streaming option — low roster priority');
+  }
+
+  return {
+    score: Math.max(0, Math.min(100, Math.round(score))),
+    priority: score >= 70 ? 'MUST_ADD' : score >= 50 ? 'STRONG_ADD' : score >= 30 ? 'ROSTER_STASH' : 'MONITOR',
+    reasoning: reasons.join('. '),
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINEUP OPTIMIZATION — Opportunity-Weighted
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function optimizeLineup(roster, week = 1, format = 'PPR') {
+  const starters = [];
+  const bench = [];
+
+  const enriched = (roster || []).map(p => {
+    const pos = String(p.position || '').split('/')[0].toUpperCase();
+    const vor = calculateVOR(p.stats || {}, pos, 12, format);
+    const bye = isOnBye(p.team, week);
+    const sustainability = analyzeSustainability(p);
+
+    let confidence = vor;
+    if (bye) confidence = 0;
+    if (sustainability.verdict === 'regression_candidate') confidence -= 5;
+    if (sustainability.verdict === 'sustainable') confidence += 5;
+
+    return {
+      ...p,
+      player_name: p.player_name || p.name,
+      pos,
+      vor,
+      isBye: bye,
+      confidence: Math.max(0, Math.min(100, confidence)),
+      sustainability: sustainability.verdict,
+    };
+  });
+
+  // Sort by confidence
+  enriched.sort((a, b) => b.confidence - a.confidence);
+
+  // Fill starter slots
+  const slots = { QB: 1, RB: 2, WR: 2, TE: 1, FLEX: 1, K: 1, DEF: 1 };
+  const filled = { QB: 0, RB: 0, WR: 0, TE: 0, FLEX: 0, K: 0, DEF: 0 };
+  const flexPositions = ['RB', 'WR', 'TE'];
+
+  // First pass: fill primary slots
+  for (const p of enriched) {
+    if (p.isBye) { bench.push(p); continue; }
+    if (slots[p.pos] && filled[p.pos] < slots[p.pos]) {
+      filled[p.pos]++;
+      starters.push(p);
+    } else if (flexPositions.includes(p.pos) && filled.FLEX < slots.FLEX) {
+      filled.FLEX++;
+      starters.push({ ...p, pos: 'FLEX' });
+    } else {
+      bench.push(p);
+    }
+  }
+
+  return { starters, bench };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DRAFT STRATEGY PROFILES — Format-Aware
+// ═══════════════════════════════════════════════════════════════════════════════
 
 const DRAFT_STRATEGIES = {
-  'Robust RB': {
-    description: 'Draft 2-3 elite RBs in rounds 1-4, build a dominant rushing foundation.',
+  'WR_FOUNDATION': {
+    name: 'WR Foundation (Recommended Default)',
+    description: 'Build elite WR core first. WRs have the longest shelf life, most sustainable production, and lowest injury rate. Layer in RBs and contingent upside afterward.',
     roundTargets: {
-      '1-2': 'Two top-12 RBs. Bell-cow backs with three-down roles.',
-      '3-5': 'Elite WR1, or third RB if top value falls. Address TE if Kelce/Andrews available.',
-      '6-9': 'Fill WR2/WR3 spots with high-target receivers. PPR-friendly pass catchers.',
-      '10-15': 'QB (if late-round strategy), handcuff RBs, backup TE, streaming DEF/K.',
+      '1-2':  'Elite WR (alpha WR1 tier) or consensus RB1 if they fall',
+      '3-4':  'Best WR/RB available — do not reach for TE/QB',
+      '5-6':  'RB2 or elite TE if available (Kelce/Andrews types only)',
+      '7-8':  'QB (unless SF), RB depth, WR3',
+      '9-11': 'Backup RBs with contingent upside — one injury away from bellcow',
+      '12-14': 'High-upside stashes, WR with role-change potential',
+      '15-16': 'DEF and K — NEVER draft these before round 14',
     },
-    archetypes: ['2-3 elite RBs', '2 high-upside WRs', 'Late-round QB'],
-    risk: 'High — RB injuries are devastating. One ACL tear tanks the team.',
-    reward: 'Dominant weekly floor from rushing volume + goal-line work.',
-    bestFor: 'Picks 1-6, Standard scoring leagues',
+    philosophy: 'WRs are the safest foundation. They peak longer, get hurt less, and are the most predictable. Build your floor with WRs, then gamble on RB upside.',
   },
-  'Hero RB': {
-    description: 'Draft one stud RB in round 1, then load up on WRs in rounds 2-5.',
+  'ROBUST_RB': {
+    name: 'Robust RB',
+    description: 'Lock in two elite RBs early and build around their positional scarcity. Risk: RB injury can wreck the investment.',
     roundTargets: {
-      '1': 'One top-5 RB — the "hero" who carries the position.',
-      '2-5': 'Three to four premium WRs. Target high-target high-ceiling receivers.',
-      '6-8': 'RB2 depth — pass-catching backs, committee members with upside.',
-      '9-15': 'QB, TE, handcuffs, streaming positions.',
+      '1-2':  'Two bell-cow RBs (snap share > 70%, goal-line role)',
+      '3-4':  'WR1 — target high target share',
+      '5-6':  'WR2 or elite TE',
+      '7-8':  'QB, WR depth',
+      '9-11': 'MUST get at least one RB handcuff for your starters',
+      '12-14': 'High-upside bench stashes',
+      '15-16': 'DEF and K',
     },
-    archetypes: ['1 elite RB', '4 premium WRs', 'RB2 from waivers'],
-    risk: 'Medium — dependent on Hero RB staying healthy and finding RB2 on waivers.',
-    reward: 'Massive WR corps creates weekly ceiling. Trade WR surplus for RB if needed.',
-    bestFor: 'PPR leagues, picks 1-5',
+    philosophy: 'If you hit on two RB1s, you have a massive structural edge. But RB injury rate is ~42%, so you MUST roster handcuffs.',
   },
-  'Zero RB': {
-    description: 'Avoid RBs entirely in first 4-5 rounds. Stack elite WRs and TE.',
+  'HERO_RB': {
+    name: 'Hero RB',
+    description: 'One elite RB in round 1-2, then go WR heavy through the mid rounds. Rely on one RB stud plus a committee of dart throws.',
     roundTargets: {
-      '1-3': 'Three elite WRs or 2 WRs + premium TE.',
-      '4-5': 'QB (if 6pt passing TD) or continue stacking WR depth.',
-      '6-10': 'RBs on the rebound — target high-upside backs. Utilize waiver wire aggressively.',
-      '11-15': 'Handcuffs, backup QB, streaming positions.',
+      '1':    'Elite bell-cow RB (top-5 ADP)',
+      '2-4':  'WR WR WR — stack alpha WRs',
+      '5-6':  'TE or QB (best available)',
+      '7-9':  'RB committee backs, backup RBs with contingent upside',
+      '10-12': 'Best WR/RB available',
+      '13-16': 'Stashes, DEF, K',
     },
-    archetypes: ['4 elite WRs', 'Premium TE', 'RBs from waivers/trades'],
-    risk: 'High — RB2 spot will be shaky all season. Must hit on waivers.',
-    reward: 'League-winning weekly ceiling from WR corps. WR depth is insurance.',
-    bestFor: 'PPR leagues, experienced managers, picks 7-12',
+    philosophy: 'One locked-in RB1 plus WR depth gives elite consistency. Fill RB2 with the waiver wire.',
   },
-  'Late-Round QB': {
-    description: 'Wait on QB until round 10+. Load premium skill position players early.',
+  'ZERO_RB': {
+    name: 'Zero RB',
+    description: 'Ignore RBs until mid rounds. Build an elite WR/TE/QB core first. Rely on waiver wire and contingent upside backs.',
     roundTargets: {
-      '1-4': 'Best available RB/WR — pure value. Ignore QB entirely.',
-      '5-7': 'Fill WR/RB depth, address TE.',
-      '8-9': 'Backup RB, handcuffs, speculative adds.',
-      '10-15': 'QB1, backup QB with rushing upside, streaming K/DEF.',
+      '1-3':  'WR WR WR/TE (if Kelce-tier TE available)',
+      '4-5':  'QB or additional WR/TE',
+      '6-9':  'RBs — target committee backs, high-upside handcuffs, goal-line backs',
+      '10-13': 'RB depth, FLEX options',
+      '14-16': 'DEF, K',
     },
-    archetypes: ['Loaded RB/WR corps', 'QB10-15 range', 'Streaming K/DEF'],
-    risk: 'Low — QB is the deepest position. QB12 averages ~3 pts/game less than QB1.',
-    reward: 'Extra premium picks at scarce positions (RB/TE).',
-    bestFor: '4pt passing TD leagues, any draft position',
+    philosophy: 'RBs are volatile and injury-prone. Build a fortress at WR/TE, then exploit RB waiver wire adds all season.',
   },
-  'TE Premium': {
-    description: 'Secure an elite TE in rounds 2-3. Pair with strong RB/WR foundation.',
+  'EARLY_TE': {
+    name: 'Early TE Premium',
+    description: 'Grab an elite TE (rounds 2-4) to lock in the most scarce position. The top 3 TEs outscore TE12 by 8+ fpts/week.',
     roundTargets: {
-      '1': 'Best available RB or WR1.',
-      '2-3': 'Elite TE (Kelce/Andrews tier). The positional advantage is 5-8 pts/week.',
-      '4-6': 'Fill RB/WR needs with remaining value.',
-      '7-15': 'QB, depth, streaming positions.',
+      '1':    'Best RB or WR available',
+      '2-3':  'Elite TE — the positional advantage is massive',
+      '4-5':  'WR WR',
+      '6-8':  'RB, QB',
+      '9-12': 'RB handcuffs, WR depth',
+      '13-16': 'Stashes, DEF, K',
     },
-    archetypes: ['Elite TE', '1-2 strong RBs', 'Solid WR corps'],
-    risk: 'Medium — paying premium for TE means thinner RB/WR depth.',
-    reward: '5-8 pt/week edge at TE. In TE premium leagues, this gap doubles.',
-    bestFor: 'TE premium scoring leagues, picks 5-10',
+    philosophy: 'If you can lock in 8+ fpts/week over the TE wasteland, that edge compounds every single week.',
   },
-}
+  'SUPERFLEX_QB_EARLY': {
+    name: 'Superflex: QB Early',
+    description: 'In superflex/2QB, QBs are THE scarce resource. Lock in two top-12 QBs early.',
+    roundTargets: {
+      '1-2':  'Elite QB + best RB/WR available (or two QBs)',
+      '3-4':  'Second QB if not taken, or elite WR',
+      '5-7':  'RB/WR BPA',
+      '8-10': 'RB depth, WR depth',
+      '11-14': 'QB3 for bye weeks, high-upside stashes',
+      '15-16': 'DEF, K',
+    },
+    philosophy: 'In SF, the QB1-QB12 gap is massive. Two top-12 QBs is a structural advantage that cannot be replicated.',
+  },
+};
 
-function getDraftStrategy(draftPosition, numTeams = 12, scoringType = 'PPR') {
-  const early = draftPosition <= 4
-  const mid = draftPosition >= 5 && draftPosition <= 8
-  const late = draftPosition >= 9
+function getDraftStrategy(draftPosition, numTeams = 12, format = 'PPR') {
+  const isSF = format === 'Superflex' || format === '2QB';
+  const pos = draftPosition || 1;
 
-  const isPPR = scoringType.toLowerCase().includes('ppr')
-  const isSixPtTD = scoringType.toLowerCase().includes('6pt')
-
-  let recommended
-  if (early && !isPPR) recommended = 'Robust RB'
-  else if (early && isPPR) recommended = 'Hero RB'
-  else if (mid) recommended = 'Late-Round QB'
-  else recommended = 'Zero RB'
+  let recommended;
+  if (isSF) {
+    recommended = 'SUPERFLEX_QB_EARLY';
+  } else if (pos <= 3) {
+    // Early picks: grab an elite RB then go WR heavy
+    recommended = 'HERO_RB';
+  } else if (pos <= 6) {
+    // Mid-early: WR foundation is strongest
+    recommended = 'WR_FOUNDATION';
+  } else if (pos <= 9) {
+    // Mid-late: WR foundation or Zero RB
+    recommended = 'WR_FOUNDATION';
+  } else {
+    // Late picks: Zero RB can work since elite RBs are gone
+    recommended = 'ZERO_RB';
+  }
 
   return {
     recommended,
     strategy: DRAFT_STRATEGIES[recommended],
-    alternatives: Object.entries(DRAFT_STRATEGIES)
-      .filter(([name]) => name !== recommended)
-      .map(([name, s]) => ({ name, bestFor: s.bestFor })),
     allStrategies: DRAFT_STRATEGIES,
-  }
+    draftPosition: pos,
+    format,
+    numTeams,
+  };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ROSTER ANALYSIS HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROSTER ANALYSIS — Structural Advantage Detection
+// ═══════════════════════════════════════════════════════════════════════════════
 
-function analyzeRosterStrengths(roster = [], leagueSize = 12) {
-  const byPosition = {}
-  const vorByPlayer = []
+function analyzeRosterStrengths(roster, leagueSize = 12, format = 'PPR') {
+  const positionalCounts = {};
+  const playersByPos = {};
 
-  roster.forEach(player => {
-    const pos = String(player.position || '').split('/')[0].toUpperCase()
-    if (!byPosition[pos]) byPosition[pos] = []
-    const vor = calculateVOR(player.stats || {}, pos, leagueSize)
-    byPosition[pos].push({ ...player, vor })
-    vorByPlayer.push({ name: player.player_name || player.name, position: pos, vor })
-  })
+  (roster || []).forEach(p => {
+    const pos = String(p.position || '').split('/')[0].split(',')[0].toUpperCase();
+    positionalCounts[pos] = (positionalCounts[pos] || 0) + 1;
+    if (!playersByPos[pos]) playersByPos[pos] = [];
+    playersByPos[pos].push(p.player_name || p.name || 'Unknown');
+  });
 
-  const surpluses = Object.entries(byPosition)
-    .filter(([pos, players]) => players.length >= 3)
-    .map(([pos, players]) => ({
-      position: pos,
-      count: players.length,
-      players: players.map(p => p.player_name || p.name),
-      scarcity: getPositionalScarcity(pos, leagueSize).tier,
-    }))
+  // Identify surpluses (trade chips) and voids (needs)
+  const slotRequirements = { QB: 1, RB: 2, WR: 2, TE: 1 };
+  const depthTargets = { QB: 2, RB: 4, WR: 4, TE: 2 };
 
-  const voids = ['QB', 'RB', 'WR', 'TE'].filter(pos =>
-    !byPosition[pos] || byPosition[pos].length === 0
-  )
+  const surpluses = [];
+  const voids = [];
 
-  const sellHigh = vorByPlayer
-    .filter(p => p.vor >= 70)
-    .sort((a, b) => b.vor - a.vor)
-    .slice(0, 3)
-    .map(p => ({ ...p, reason: 'High VOR — trade from strength' }))
+  for (const [pos, required] of Object.entries(slotRequirements)) {
+    const count = positionalCounts[pos] || 0;
+    const depth = depthTargets[pos];
 
-  const buyLow = vorByPlayer
-    .filter(p => p.vor <= 35 && p.vor > 0)
-    .sort((a, b) => a.vor - b.vor)
-    .slice(0, 3)
-    .map(p => ({ ...p, reason: 'Low VOR vs expected — buy low or cut' }))
-
-  return { byPosition, surpluses, voids, sellHigh, buyLow, vorByPlayer }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// I) PLAYER INTELLIGENCE GENERATOR (for Claude context enrichment)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function generatePlayerIntelligence(playerData) {
-  if (!playerData || !playerData.stats) return null
-
-  const s = playerData.stats
-  const type = playerData.type || 'offensive'
-  const summaryParts = []
-
-  if (type === 'qb' || playerData.position === 'QB') {
-    const passYds = parseInt(s.passYds || s.Pass_Yds || 0)
-    const passTDs = parseInt(s.passTDs || s.Pass_TDs || 0)
-    const ints = parseInt(s.INTs || s.Int || 0)
-    const rushYds = parseInt(s.rushYds || s.Rush_Yds || 0)
-    if (passYds) summaryParts.push(`${passYds} pass yds`)
-    if (passTDs) summaryParts.push(`${passTDs} pass TDs`)
-    if (ints) summaryParts.push(`${ints} INTs`)
-    if (rushYds > 200) summaryParts.push(`${rushYds} rush yds (dual-threat)`)
-  } else {
-    const rushYds = parseInt(s.rushYds || s.Rush_Yds || 0)
-    const rushTDs = parseInt(s.rushTDs || s.Rush_TDs || 0)
-    const rec = parseInt(s.rec || s.Rec || 0)
-    const recYds = parseInt(s.recYds || s.Rec_Yds || 0)
-    const recTDs = parseInt(s.recTDs || s.Rec_TDs || 0)
-    if (rushYds) summaryParts.push(`${rushYds} rush yds, ${rushTDs} rush TDs`)
-    if (rec) summaryParts.push(`${rec} rec, ${recYds} rec yds, ${recTDs} rec TDs`)
-  }
-
-  return {
-    summary: summaryParts.join(' | ') || 'No stat data available',
-    stats: s,
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// J) CATEGORY ANALYSIS (for H2H matchups)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function analyzeCategories(myStats = {}, leagueStandings = [], scoringType = 'H2H Points') {
-  const result = { punt: [], chase: [], locked: [], swing: [], advice: '' }
-
-  // NFL is primarily H2H points, so analyze matchup directly
-  const opponent = leagueStandings[0] || {}
-  const myPts = parseFloat(myStats.points || myStats['57'] || 0)
-  const oppPts = parseFloat(opponent.stats?.points || opponent.stats?.['57'] || opponent.points || 0)
-
-  if (myPts > 0 && oppPts > 0) {
-    const gap = myPts - oppPts
-    const pct = Math.abs(gap) / Math.max(myPts, 1) * 100
-
-    if (gap > 0 && pct > 15) {
-      result.advice = `You're projected to win by ${gap.toFixed(1)} points. Protect your lead — bench risky boom/bust players for safe floors.`
-      result.locked.push('Total Points')
-    } else if (gap < 0 && pct > 15) {
-      result.advice = `You're projected to lose by ${Math.abs(gap).toFixed(1)} points. Swing for the fences — start boom/bust players with high ceilings.`
-      result.punt.push('Safety')
-    } else {
-      result.advice = `Close matchup — projected within ${Math.abs(gap).toFixed(1)} points. Every roster decision matters. Optimize every slot.`
-      result.swing.push('Total Points')
+    if (count > depth) {
+      surpluses.push({
+        position: pos,
+        count,
+        excess: count - depth,
+        players: playersByPos[pos] || [],
+      });
     }
-  } else {
-    result.advice = 'No matchup data — optimize for maximum total production.'
+    if (count < required) {
+      voids.push(pos);
+    }
   }
 
-  return result
+  // Identify sell-high / buy-low candidates
+  const sellHigh = [];
+  const buyLow = [];
+
+  (roster || []).forEach(p => {
+    const sustainability = analyzeSustainability(p);
+    if (sustainability.verdict === 'regression_candidate') {
+      sellHigh.push({
+        player: p.player_name || p.name,
+        reasons: sustainability.signals.filter(s => s.impact < 0).map(s => s.detail),
+      });
+    }
+  });
+
+  return { surpluses, voids, sellHigh, buyLow, positionalCounts };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLAYER INTELLIGENCE GENERATOR — Concise context for AI prompts
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function generatePlayerIntelligence(player) {
+  const pos = String(player.position || '').split('/')[0].toUpperCase();
+  const stats = player.stats || {};
+  const lines = [];
+
+  lines.push(`${player.name || player.player_name} (${pos}, ${player.team || '?'})`);
+
+  const vor = calculateVOR(stats, pos, 12);
+  lines.push(`VOR: ${vor}/100`);
+
+  const sustainability = analyzeSustainability(player);
+  if (sustainability.signals.length) {
+    lines.push(`Flags: ${sustainability.signals.map(s => s.flag).join(', ')}`);
+  }
+
+  const env = getScoringEnvironment(player.team || '');
+  lines.push(`Scoring env: ${env}`);
+
+  return lines.join(' | ');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // EXPORTS
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
 
 module.exports = {
-  // Positional analysis
-  getPositionalScarcity,
-  getScoringMultiplier,
-  POSITIONAL_DATA,
-  BYE_WEEKS,
-
-  // Value calculations
+  // Core evaluation
   calculateVOR,
-  analyzeCategories,
+  getPositionalScarcity,
+  analyzeSustainability,
+  evaluateContingentUpside,
+  getScoringEnvironment,
 
-  // Matchup & schedule
-  getMatchupQuality,
+  // Game intelligence
   isOnBye,
+  getMatchupQuality,
 
-  // Trade
+  // Trade & roster
   evaluateTrade,
-
-  // Waiver wire
   scoreWaiverTarget,
-
-  // Lineup
   optimizeLineup,
+  analyzeRosterStrengths,
 
   // Draft
   getDraftStrategy,
-  DRAFT_STRATEGIES,
 
-  // Roster analysis
-  analyzeRosterStrengths,
+  // Utilities
   generatePlayerIntelligence,
-}
+
+  // Constants (for external access)
+  FORMATS,
+  POSITIONAL_TIERS,
+  DRAFT_STRATEGIES,
+};
