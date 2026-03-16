@@ -59,12 +59,47 @@ function toArray(obj) {
 }
 
 async function getLeagues() {
-  const data = await yahooGet('/users;use_login=1/games;game_keys=nfl/leagues');
+  // Fetch ALL NFL game seasons the user has leagues in (not just current)
+  const data = await yahooGet('/users;use_login=1/games;game_codes=nfl/leagues');
 
-  const leagues = data?.fantasy_content?.users?.['0']?.user?.[1]?.games?.['0']?.game?.[1]?.leagues;
-  if (!leagues) return [];
+  const gamesObj = data?.fantasy_content?.users?.['0']?.user?.[1]?.games;
+  const allLeagues = [];
 
-  return toArray(leagues).map(l => l?.league?.[0]).filter(Boolean);
+  // Iterate through all NFL game seasons
+  const gameCount = parseInt(gamesObj?.['@attributes']?.count || gamesObj?.count || 0);
+  const numericKeys = Object.keys(gamesObj || {}).filter(k => /^\d+$/.test(k));
+  const total = Math.max(gameCount, numericKeys.length);
+
+  for (let g = 0; g < total; g++) {
+    const gameEntry = gamesObj?.[g] || gamesObj?.[String(g)];
+    const game = gameEntry?.game;
+    if (!game) continue;
+
+    const gameInfo = Array.isArray(game[0]) ? Object.assign({}, ...game[0]) : (game[0] || {});
+    const season = gameInfo?.season || 'unknown';
+    const gameKey = gameInfo?.game_key || 'nfl';
+
+    const leaguesObj = game[1]?.leagues;
+    if (!leaguesObj) continue;
+
+    const leagueList = toArray(leaguesObj);
+    for (const l of leagueList) {
+      const leagueData = l?.league?.[0];
+      if (leagueData) {
+        allLeagues.push({
+          ...leagueData,
+          season,
+          game_key: gameKey,
+          is_current: parseInt(season) >= 2026,
+        });
+      }
+    }
+  }
+
+  // Sort: current/newest seasons first
+  allLeagues.sort((a, b) => parseInt(b.season || 0) - parseInt(a.season || 0));
+
+  return allLeagues;
 }
 
 async function getLeague(leagueKey) {
@@ -228,7 +263,8 @@ async function getFreeAgentsTrending(leagueKey, count = 25) {
 
 async function getUserTeamKey(leagueKey) {
   try {
-    const data = await yahooGet(`/users;use_login=1/games;game_keys=nfl/leagues;league_keys=${leagueKey}/teams`);
+    // Use game_codes=nfl to search across all NFL seasons (not just current)
+    const data = await yahooGet(`/users;use_login=1/games;game_codes=nfl/leagues;league_keys=${leagueKey}/teams`);
 
     const gamesObj = data?.fantasy_content?.users?.['0']?.user?.[1]?.games;
     const gameList = toArray(gamesObj);
